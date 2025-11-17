@@ -1,0 +1,6 @@
+adminUser: admin
+adminPassword: "$(GRAFANA_ADMIN_PASSWORD)"
+service:
+type: LoadBalancer
+plugins:
+- grafana-image-renderer

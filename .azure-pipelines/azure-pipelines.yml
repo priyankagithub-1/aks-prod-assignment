@@ -1,0 +1,113 @@
+trigger:
+  branches:
+    include:
+      - main
+
+schedules:
+- cron: "0 1 * * *" # run daily at 01:00 UTC
+  displayName: Daily grafana report
+  branches:
+    include:
+      - main
+  always: true
+
+variables:
+  terraformVersion: '1.4.6'
+  azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+  acrName: '$(ACR_NAME)'
+  resourceGroup: '$(TF_VAR_rg_name)'
+
+stages:
+- stage: Terraform
+  displayName: Terraform
+  jobs:
+  - job: TerraformPlan
+    pool: vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.x'
+    - script: |
+        set -e
+        ./azure-pipelines/scripts/terraform-init-apply.sh plan
+      displayName: 'Terraform init & plan'
+    - script: ./azure-pipelines/scripts/checkov-scan.sh
+      displayName: 'Checkov scan'
+    
+  - job: TerraformApply
+    dependsOn: TerraformPlan
+    pool: vmImage: 'ubuntu-latest'
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'Manual'))
+    steps:
+    - checkout: self
+    - script: |
+        ./azure-pipelines/scripts/terraform-init-apply.sh apply
+      displayName: 'Terraform apply (manual)'
+
+- stage: Build
+  dependsOn: Terraform
+  jobs:
+  - job: BuildAndPush
+    pool: vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+    - script: ./azure-pipelines/scripts/build-and-push.sh
+      env:
+        ACR_NAME: $(acrName)
+      displayName: 'Build, tag and push image to ACR'
+
+- stage: Deploy
+  dependsOn: Build
+  jobs:
+  - job: HelmDeploy
+    pool: vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          # Get AKS credentials
+          az aks get-credentials -n $(TF_VAR_aks_name) -g $(TF_VAR_rg_name) --overwrite-existing
+          # Deploy/update app via kubectl or helm
+          helm upgrade --install sample-app ./charts/sample-app \
+            --set image.repository=$(ACR_NAME).azurecr.io/sample-app --set image.tag=$(Build.BuildId)
+
+- stage: Monitoring
+  dependsOn: Deploy
+  jobs:
+  - job: InstallMonitoring
+    pool: vmImage: 'ubuntu-latest'
+    steps:
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az aks get-credentials -n $(TF_VAR_aks_name) -g $(TF_VAR_rg_name) --overwrite-existing
+          # Add repos
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+          helm upgrade --install prometheus prometheus-community/prometheus -f k8s/helm-values/prometheus-values.yaml
+          helm upgrade --install grafana grafana/grafana -f k8s/helm-values/grafana-values.yaml
+
+- stage: Report
+  dependsOn: Monitoring
+  condition: always()
+  jobs:
+  - job: GrafanaExport
+    pool: vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: none
+    - script: ./azure-pipelines/scripts/grafana-export.sh
+      env:
+        GRAFANA_URL: 'http://$(GRAFANA_SERVICE_IP):3000'
+        GRAFANA_API_KEY: $(GRAFANA_API_KEY)
+        AZURE_STORAGE_ACCOUNT: $(REPORT_STORAGE_ACCOUNT)
+        AZURE_STORAGE_KEY: $(REPORT_STORAGE_KEY)
+      displayName: 'Export Grafana dashboards to blob storage'
